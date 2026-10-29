@@ -35,3 +35,28 @@ func TestExecuteWorkflowVerboseFlag(t *testing.T) {
 		t.Fatalf("default: got %q", flag.DefValue)
 	}
 }
+
+func TestExecuteWorkflowFormatFlag(t *testing.T) {
+	t.Parallel()
+	flag := executeCmd.Flags().Lookup("format")
+	if flag == nil {
+		t.Fatal("missing --format")
+	}
+	if flag.DefValue != "text" {
+		t.Fatalf("default: got %q, want text", flag.DefValue)
+	}
+}
+
+func TestExecuteWorkflowOutputFlag(t *testing.T) {
+	t.Parallel()
+	flag := executeCmd.Flags().Lookup("output")
+	if flag == nil {
+		t.Fatal("missing --output")
+	}
+	if flag.Shorthand != "o" {
+		t.Fatalf("shorthand: got %q, want o", flag.Shorthand)
+	}
+	if flag.DefValue != "" {
+		t.Fatalf("default: got %q, want empty", flag.DefValue)
+	}
+}

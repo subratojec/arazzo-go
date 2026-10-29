@@ -3,15 +3,21 @@ package commands
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/shaunhoulihan/arazzo-go/internal/runner"
 )
 
 var (
 	executeWorkflowID string
 	executeInputs     string
 	executeVerbose    bool
+	executeFormat     string
+	executeOutput     string
 )
 
 var executeCmd = &cobra.Command{
@@ -29,6 +35,14 @@ HTTP request and response traces are off by default. Pass --verbose (or
 `,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		format := strings.ToLower(strings.TrimSpace(executeFormat))
+		if format == "" {
+			format = "text"
+		}
+		if format != "text" && format != "json" && format != "junit" {
+			return fmt.Errorf("unsupported output format %q: expected text, json, or junit", executeFormat)
+		}
+
 		inputs := map[string]any{}
 		if strings.TrimSpace(executeInputs) != "" {
 			if err := json.Unmarshal([]byte(executeInputs), &inputs); err != nil {
@@ -41,12 +55,43 @@ HTTP request and response traces are off by default. Pass --verbose (or
 			return err
 		}
 
-		result, err := r.ExecuteWorkflow(cmd.Context(), executeWorkflowID, inputs)
-		if err != nil {
-			return fmt.Errorf("workflow failed to start: %w", err)
+		result, execErr := r.ExecuteWorkflow(cmd.Context(), executeWorkflowID, inputs)
+		if result == nil {
+			// If execution failed before producing a result, synthesize one
+			// so machine-readable formats (json, junit) still emit a valid report.
+			result = &runner.Result{
+				WorkflowId: executeWorkflowID,
+				Success:    false,
+				Error:      execErr,
+			}
 		}
-		fmt.Print(formatResult(result))
+
+		formatted, fmtErr := formatWorkflowResult(result, format)
+		if fmtErr != nil {
+			return fmtErr
+		}
+
+		if strings.TrimSpace(executeOutput) != "" {
+			outPath := strings.TrimSpace(executeOutput)
+			if dir := filepath.Dir(outPath); dir != "" && dir != "." {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					return fmt.Errorf("create output directory: %w", err)
+				}
+			}
+			if err := os.WriteFile(outPath, []byte(formatted), 0o644); err != nil {
+				return fmt.Errorf("write output file: %w", err)
+			}
+		} else {
+			fmt.Print(formatted)
+		}
+
+		if execErr != nil {
+			return fmt.Errorf("workflow failed to start: %w", execErr)
+		}
 		if !result.Success {
+			if result.Error != nil {
+				return fmt.Errorf("workflow %s failed: %w", result.WorkflowId, result.Error)
+			}
 			return fmt.Errorf("workflow %s failed", result.WorkflowId)
 		}
 		return nil
@@ -57,6 +102,8 @@ func init() {
 	executeCmd.Flags().StringVar(&executeWorkflowID, "workflow-id", "", "workflow to run")
 	executeCmd.Flags().StringVar(&executeInputs, "inputs", "{}", "JSON object of workflow inputs")
 	executeCmd.Flags().BoolVarP(&executeVerbose, "verbose", "v", false, "log each HTTP request and response")
+	executeCmd.Flags().StringVar(&executeFormat, "format", "text", "output format: text, json, or junit")
+	executeCmd.Flags().StringVarP(&executeOutput, "output", "o", "", "write report to file instead of stdout")
 	_ = executeCmd.MarkFlagRequired("workflow-id")
 	rootCmd.AddCommand(executeCmd)
 }

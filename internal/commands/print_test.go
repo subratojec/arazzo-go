@@ -1,7 +1,14 @@
 package commands
 
 import (
+	"context"
+	"encoding/json"
+	"encoding/xml"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -81,6 +88,173 @@ func TestFormatResult(t *testing.T) {
 	}
 }
 
+func TestFormatJSONResult(t *testing.T) {
+	result := &libarazzo.WorkflowResult{
+		WorkflowId: "test-workflow",
+		Success:    false,
+		Duration:   15 * time.Millisecond,
+		Error:      errors.New("workflow error"),
+		Outputs: map[string]any{
+			"sessionToken": "secret-xyz",
+			"publicData":   "hello",
+		},
+		Steps: []*libarazzo.StepResult{
+			{
+				StepId:     "step-1",
+				Success:    true,
+				Duration:   5 * time.Millisecond,
+				StatusCode: 200,
+				Outputs: map[string]any{
+					"passwordHash": "secret-hash",
+				},
+			},
+			{
+				StepId:     "step-2",
+				Success:    false,
+				Duration:   10 * time.Millisecond,
+				StatusCode: 401,
+				Error:      errors.New("unauthorized"),
+			},
+		},
+	}
+
+	got, err := formatJSONResult(result)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var parsed JSONWorkflowResult
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+
+	if parsed.WorkflowID != "test-workflow" || parsed.Success {
+		t.Errorf("unexpected parsed workflow header: %+v", parsed)
+	}
+	if parsed.Error == nil || *parsed.Error != "workflow error" {
+		t.Errorf("unexpected error: %v", parsed.Error)
+	}
+	if parsed.DurationMS != 15.0 {
+		t.Errorf("got duration %v, want 15.0", parsed.DurationMS)
+	}
+	if len(parsed.Steps) != 2 {
+		t.Fatalf("expected 2 steps, got %d", len(parsed.Steps))
+	}
+
+	// Verify secrets are redacted in outputs
+	if parsed.Outputs["sessionToken"] != "***" {
+		t.Errorf("sessionToken not redacted: %v", parsed.Outputs["sessionToken"])
+	}
+	if parsed.Outputs["publicData"] != "hello" {
+		t.Errorf("publicData changed: %v", parsed.Outputs["publicData"])
+	}
+	if parsed.Steps[0].Outputs["passwordHash"] != "***" {
+		t.Errorf("passwordHash not redacted: %v", parsed.Steps[0].Outputs["passwordHash"])
+	}
+}
+
+func TestFormatJUnitResult(t *testing.T) {
+	result := &libarazzo.WorkflowResult{
+		WorkflowId: "checkout-flow",
+		Success:    false,
+		Duration:   2500 * time.Millisecond,
+		Steps: []*libarazzo.StepResult{
+			{
+				StepId:   "login",
+				Success:  true,
+				Duration: 500 * time.Millisecond,
+			},
+			{
+				StepId:   "pay",
+				Success:  false,
+				Duration: 2000 * time.Millisecond,
+				Error:    errors.New("insufficient funds"),
+			},
+		},
+	}
+
+	got, err := formatJUnitResult(result)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.HasPrefix(got, xml.Header) {
+		t.Errorf("missing xml header: %q", got)
+	}
+
+	var suites JUnitTestSuites
+	if err := xml.Unmarshal([]byte(got), &suites); err != nil {
+		t.Fatalf("invalid xml: %v", err)
+	}
+
+	if suites.Tests != 2 || suites.Failures != 1 {
+		t.Errorf("expected tests=2, failures=1; got tests=%d failures=%d", suites.Tests, suites.Failures)
+	}
+	if len(suites.TestSuite) != 1 {
+		t.Fatalf("expected 1 testsuite, got %d", len(suites.TestSuite))
+	}
+
+	suite := suites.TestSuite[0]
+	if suite.Name != "checkout-flow" || suite.Tests != 2 || suite.Failures != 1 {
+		t.Errorf("unexpected testsuite attributes: %+v", suite)
+	}
+	if len(suite.TestCases) != 2 {
+		t.Fatalf("expected 2 testcases, got %d", len(suite.TestCases))
+	}
+	if suite.TestCases[0].Failure != nil {
+		t.Errorf("login should not have failure")
+	}
+	if suite.TestCases[1].Failure == nil || suite.TestCases[1].Failure.Message != "insufficient funds" {
+		t.Errorf("pay should have failure with 'insufficient funds'")
+	}
+}
+
+func TestWorkflowLevelErrorOutputs(t *testing.T) {
+	result := &libarazzo.WorkflowResult{
+		WorkflowId: "empty-flow",
+		Success:    false,
+		Duration:   0,
+		Error:      errors.New("failed before starting"),
+		Steps:      nil,
+	}
+
+	// 1. JSON should have steps: [] and error set
+	jsonOut, err := formatJSONResult(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed JSONWorkflowResult
+	if err := json.Unmarshal([]byte(jsonOut), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Error == nil || *parsed.Error != "failed before starting" {
+		t.Errorf("expected error string, got %v", parsed.Error)
+	}
+	if len(parsed.Steps) != 0 {
+		t.Errorf("expected 0 steps, got %d", len(parsed.Steps))
+	}
+
+	// 2. JUnit should emit 1 synthetic testcase with failure
+	junitOut, err := formatJUnitResult(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var suites JUnitTestSuites
+	if err := xml.Unmarshal([]byte(junitOut), &suites); err != nil {
+		t.Fatal(err)
+	}
+	if suites.Tests != 1 || suites.Failures != 1 {
+		t.Errorf("expected tests=1, failures=1; got tests=%d failures=%d", suites.Tests, suites.Failures)
+	}
+	if len(suites.TestSuite) != 1 || len(suites.TestSuite[0].TestCases) != 1 {
+		t.Fatalf("expected 1 testcase, got %v", suites.TestSuite)
+	}
+	tc := suites.TestSuite[0].TestCases[0]
+	if tc.Name != "workflow" || tc.Failure == nil || tc.Failure.Message != "failed before starting" {
+		t.Errorf("unexpected synthetic testcase: %+v", tc)
+	}
+}
+
 func TestFormatJSONRendersYAMLMappingNodes(t *testing.T) {
 	node := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 	node.Content = []*yaml.Node{
@@ -95,5 +269,85 @@ func TestFormatJSONRendersYAMLMappingNodes(t *testing.T) {
 	}
 	if strings.Contains(got, `"Kind"`) {
 		t.Fatalf("raw yaml.Node leaked: %s", got)
+	}
+}
+
+func TestGoldenFilesWithLoginWorkflow(t *testing.T) {
+	// Set up mock auth server matching testdata/login.arazzo.yaml
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/auth/login" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{Name: "ifc_session", Value: "id-token", Path: "/"})
+		http.SetCookie(w, &http.Cookie{Name: "ifc_csrf", Value: "csrf-token", Path: "/"})
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	// Load workflow from testdata/login.arazzo.yaml
+	specPath := filepath.Join("..", "..", "testdata", "login.arazzo.yaml")
+	r, err := runner.FromFile(specPath)
+	if err != nil {
+		t.Fatalf("load runner: %v", err)
+	}
+
+	result, err := r.ExecuteWorkflow(context.Background(), "login-with-password", map[string]any{
+		"email":    "user@example.com",
+		"password": "secret",
+		"baseUrl":  srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("execute login: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("expected success, got: %v", result.Error)
+	}
+
+	// Normalize durations to ensure deterministic golden file output
+	result.Duration = 10 * time.Millisecond
+	for _, step := range result.Steps {
+		step.Duration = 10 * time.Millisecond
+	}
+
+	// 1. Check JSON Golden File
+	jsonOut, err := formatJSONResult(result)
+	if err != nil {
+		t.Fatalf("format json: %v", err)
+	}
+	compareOrUpdateGolden(t, filepath.Join("..", "..", "testdata", "login_result.json.golden"), jsonOut)
+
+	// 2. Check JUnit Golden File
+	junitOut, err := formatJUnitResult(result)
+	if err != nil {
+		t.Fatalf("format junit: %v", err)
+	}
+	compareOrUpdateGolden(t, filepath.Join("..", "..", "testdata", "login_result.junit.golden"), junitOut)
+}
+
+func compareOrUpdateGolden(t *testing.T, path, actual string) {
+	t.Helper()
+	if os.Getenv("UPDATE_GOLDEN") == "1" {
+		if err := os.WriteFile(path, []byte(actual), 0o644); err != nil {
+			t.Fatalf("failed to update golden file %s: %v", path, err)
+		}
+		return
+	}
+
+	expectedBytes, err := os.ReadFile(path)
+	if err != nil {
+		// If file doesn't exist yet, write it
+		if os.IsNotExist(err) {
+			if writeErr := os.WriteFile(path, []byte(actual), 0o644); writeErr != nil {
+				t.Fatalf("failed to create golden file %s: %v", path, writeErr)
+			}
+			return
+		}
+		t.Fatalf("failed to read golden file %s: %v", path, err)
+	}
+
+	expected := string(expectedBytes)
+	if strings.TrimSpace(actual) != strings.TrimSpace(expected) {
+		t.Errorf("golden mismatch for %s:\n--- Expected ---\n%s\n--- Actual ---\n%s", path, expected, actual)
 	}
 }

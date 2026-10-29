@@ -38,9 +38,18 @@ Build Time: %s`,
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(ui.Apply(ui.Error, fmt.Sprintf("Error: %v", err)))
+		printError(err)
 		os.Exit(1)
 	}
+}
+
+func printError(err error) {
+	fmtMode := strings.ToLower(strings.TrimSpace(executeFormat))
+	if fmtMode == "json" || fmtMode == "junit" {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	fmt.Fprintln(os.Stderr, ui.Apply(ui.Error, fmt.Sprintf("Error: %v", err)))
 }
 
 func init() {

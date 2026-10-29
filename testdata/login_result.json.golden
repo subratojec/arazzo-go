@@ -1,0 +1,25 @@
+{
+  "workflowId": "login-with-password",
+  "success": true,
+  "durationMs": 10,
+  "error": null,
+  "outputs": {
+    "challengeEncountered": null,
+    "loginSetCookie": "***"
+  },
+  "steps": [
+    {
+      "stepId": "submit-credentials",
+      "success": true,
+      "durationMs": 10,
+      "statusCode": 204,
+      "error": null,
+      "outputs": {
+        "challengeName": null,
+        "challengeParameters": null,
+        "challengeSession": "***",
+        "setCookie": "***"
+      }
+    }
+  ]
+}

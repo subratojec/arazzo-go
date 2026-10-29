@@ -2,14 +2,76 @@ package commands
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/shaunhoulihan/arazzo-go/internal/executor"
 	"github.com/shaunhoulihan/arazzo-go/internal/runner"
 	"github.com/shaunhoulihan/arazzo-go/internal/ui"
 	"go.yaml.in/yaml/v4"
 )
+
+// JSONWorkflowResult represents the structured JSON output for a workflow execution.
+type JSONWorkflowResult struct {
+	WorkflowID string           `json:"workflowId"`
+	Success    bool             `json:"success"`
+	DurationMS float64          `json:"durationMs"`
+	Error      *string          `json:"error"`
+	Outputs    map[string]any   `json:"outputs,omitempty"`
+	Steps      []JSONStepResult `json:"steps"`
+}
+
+// JSONStepResult represents a single executed step inside the JSON workflow result.
+type JSONStepResult struct {
+	StepID     string         `json:"stepId"`
+	Success    bool           `json:"success"`
+	DurationMS float64        `json:"durationMs"`
+	StatusCode int            `json:"statusCode,omitempty"`
+	Retries    int            `json:"retries,omitempty"`
+	Error      *string        `json:"error"`
+	Outputs    map[string]any `json:"outputs,omitempty"`
+}
+
+// JUnitTestSuites is the root XML container for JUnit test reports.
+type JUnitTestSuites struct {
+	XMLName   xml.Name         `xml:"testsuites"`
+	Name      string           `xml:"name,attr,omitempty"`
+	Tests     int              `xml:"tests,attr"`
+	Failures  int              `xml:"failures,attr"`
+	Errors    int              `xml:"errors,attr"`
+	Time      string           `xml:"time,attr"`
+	TestSuite []JUnitTestSuite `xml:"testsuite"`
+}
+
+// JUnitTestSuite represents a single testsuite mapping to an Arazzo workflow.
+type JUnitTestSuite struct {
+	XMLName   xml.Name        `xml:"testsuite"`
+	Name      string          `xml:"name,attr"`
+	Tests     int             `xml:"tests,attr"`
+	Failures  int             `xml:"failures,attr"`
+	Errors    int             `xml:"errors,attr"`
+	Time      string          `xml:"time,attr"`
+	TestCases []JUnitTestCase `xml:"testcase"`
+}
+
+// JUnitTestCase represents an executed step (or workflow-level check) inside a suite.
+type JUnitTestCase struct {
+	XMLName   xml.Name      `xml:"testcase"`
+	Name      string        `xml:"name,attr"`
+	Classname string        `xml:"classname,attr"`
+	Time      string        `xml:"time,attr"`
+	Failure   *JUnitFailure `xml:"failure,omitempty"`
+}
+
+// JUnitFailure describes a failed assertion or execution error.
+type JUnitFailure struct {
+	Message string `xml:"message,attr"`
+	Type    string `xml:"type,attr,omitempty"`
+	Content string `xml:",chardata"`
+}
 
 func formatWorkflowList(workflows []runner.WorkflowInfo) string {
 	var b strings.Builder
@@ -91,6 +153,19 @@ func formatWorkflowInfo(info *runner.WorkflowInfo) string {
 	return b.String()
 }
 
+func formatWorkflowResult(result *runner.Result, format string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "", "text":
+		return formatResult(result), nil
+	case "json":
+		return formatJSONResult(result)
+	case "junit":
+		return formatJUnitResult(result)
+	default:
+		return "", fmt.Errorf("unsupported output format %q: expected text, json, or junit", format)
+	}
+}
+
 func formatResult(result *runner.Result) string {
 	if result == nil {
 		return ""
@@ -132,6 +207,149 @@ func formatResult(result *runner.Result) string {
 		}
 	}
 	return b.String()
+}
+
+func formatJSONResult(result *runner.Result) (string, error) {
+	if result == nil {
+		return "{}\n", nil
+	}
+
+	res := JSONWorkflowResult{
+		WorkflowID: result.WorkflowId,
+		Success:    result.Success,
+		DurationMS: durationToMS(result.Duration),
+		Outputs:    cleanOutputs(result.Outputs),
+		Steps:      make([]JSONStepResult, 0, len(result.Steps)),
+	}
+
+	if result.Error != nil {
+		errStr := result.Error.Error()
+		res.Error = &errStr
+	}
+
+	for _, step := range result.Steps {
+		if step == nil {
+			continue
+		}
+		sr := JSONStepResult{
+			StepID:     step.StepId,
+			Success:    step.Success,
+			DurationMS: durationToMS(step.Duration),
+			StatusCode: step.StatusCode,
+			Retries:    step.Retries,
+			Outputs:    cleanOutputs(step.Outputs),
+		}
+		if step.Error != nil {
+			errStr := step.Error.Error()
+			sr.Error = &errStr
+		}
+		res.Steps = append(res.Steps, sr)
+	}
+
+	bytes, err := json.MarshalIndent(res, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal json result: %w", err)
+	}
+	return string(bytes) + "\n", nil
+}
+
+func formatJUnitResult(result *runner.Result) (string, error) {
+	if result == nil {
+		result = &runner.Result{WorkflowId: "unknown", Success: false}
+	}
+
+	suite := JUnitTestSuite{
+		Name:      result.WorkflowId,
+		Time:      formatSeconds(result.Duration),
+		TestCases: make([]JUnitTestCase, 0, len(result.Steps)),
+	}
+
+	if len(result.Steps) == 0 {
+		// When no steps ran (e.g. workflow-level error), emit a synthetic testcase
+		// so CI still gets a valid testsuite with a failure rather than an empty report.
+		suite.Tests = 1
+		tc := JUnitTestCase{
+			Name:      "workflow",
+			Classname: result.WorkflowId,
+			Time:      formatSeconds(result.Duration),
+		}
+		if !result.Success || result.Error != nil {
+			suite.Failures = 1
+			errMsg := "workflow failed"
+			if result.Error != nil {
+				errMsg = result.Error.Error()
+			}
+			tc.Failure = &JUnitFailure{
+				Message: errMsg,
+				Type:    "WorkflowFailure",
+				Content: errMsg,
+			}
+		}
+		suite.TestCases = append(suite.TestCases, tc)
+	} else {
+		suite.Tests = len(result.Steps)
+		for _, step := range result.Steps {
+			if step == nil {
+				continue
+			}
+			tc := JUnitTestCase{
+				Name:      step.StepId,
+				Classname: result.WorkflowId,
+				Time:      formatSeconds(step.Duration),
+			}
+			if !step.Success {
+				suite.Failures++
+				errMsg := "step failed"
+				if step.Error != nil {
+					errMsg = step.Error.Error()
+				}
+				tc.Failure = &JUnitFailure{
+					Message: errMsg,
+					Type:    "StepFailure",
+					Content: errMsg,
+				}
+			}
+			suite.TestCases = append(suite.TestCases, tc)
+		}
+	}
+
+	suites := JUnitTestSuites{
+		Name:      "arazzo",
+		Tests:     suite.Tests,
+		Failures:  suite.Failures,
+		Errors:    0,
+		Time:      suite.Time,
+		TestSuite: []JUnitTestSuite{suite},
+	}
+
+	data, err := xml.MarshalIndent(suites, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal junit xml: %w", err)
+	}
+	return xml.Header + string(data) + "\n", nil
+}
+
+func durationToMS(d time.Duration) float64 {
+	// Microsecond precision: e.g. 1250 µs -> 1.25 ms
+	return float64(d.Microseconds()) / 1000.0
+}
+
+func formatSeconds(d time.Duration) string {
+	return fmt.Sprintf("%.3f", d.Seconds())
+}
+
+func cleanOutputs(raw map[string]any) map[string]any {
+	if len(raw) == 0 {
+		return nil
+	}
+	j := jsonable(raw)
+	m, ok := j.(map[string]any)
+	if !ok {
+		return nil
+	}
+	redacted := executor.RedactValue(m)
+	res, _ := redacted.(map[string]any)
+	return res
 }
 
 func formatJSON(v any) string {

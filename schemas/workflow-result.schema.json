@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/shaunhoulihan/arazzo-go/schemas/workflow-result.schema.json",
+  "title": "Arazzo Workflow Result",
+  "description": "Schema for machine-readable JSON execution results of arazzo-go workflows.",
+  "type": "object",
+  "required": ["workflowId", "success", "durationMs", "steps"],
+  "properties": {
+    "workflowId": {
+      "type": "string",
+      "description": "Identifier of the executed workflow."
+    },
+    "success": {
+      "type": "boolean",
+      "description": "True if the workflow and all its required steps succeeded."
+    },
+    "durationMs": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Total execution duration of the workflow in milliseconds."
+    },
+    "error": {
+      "type": ["string", "null"],
+      "description": "Workflow-level error message if failed, or null if successful."
+    },
+    "outputs": {
+      "type": "object",
+      "description": "Key-value map of workflow output parameters (redacted for secrets).",
+      "additionalProperties": true
+    },
+    "steps": {
+      "type": "array",
+      "description": "List of executed step results in execution order.",
+      "items": {
+        "type": "object",
+        "required": ["stepId", "success", "durationMs"],
+        "properties": {
+          "stepId": {
+            "type": "string",
+            "description": "Identifier of the step."
+          },
+          "success": {
+            "type": "boolean",
+            "description": "True if the step satisfied its success criteria."
+          },
+          "durationMs": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Step execution duration in milliseconds."
+          },
+          "statusCode": {
+            "type": "integer",
+            "description": "HTTP status code returned by the operation."
+          },
+          "retries": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of retries attempted before completion."
+          },
+          "error": {
+            "type": ["string", "null"],
+            "description": "Step error message if failed, or null if passed."
+          },
+          "outputs": {
+            "type": "object",
+            "description": "Outputs extracted from this step (redacted for secrets).",
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

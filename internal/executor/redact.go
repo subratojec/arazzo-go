@@ -29,7 +29,8 @@ func isSecretKey(key string) bool {
 	return false
 }
 
-func redactValue(v any) any {
+// RedactValue recursively walks maps and slices, masking values whose keys match secret patterns.
+func RedactValue(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
 		out := make(map[string]any, len(t))
@@ -38,13 +39,13 @@ func redactValue(v any) any {
 				out[k] = "***"
 				continue
 			}
-			out[k] = redactValue(val)
+			out[k] = RedactValue(val)
 		}
 		return out
 	case []any:
 		out := make([]any, len(t))
 		for i, val := range t {
-			out[i] = redactValue(val)
+			out[i] = RedactValue(val)
 		}
 		return out
 	default:
@@ -52,8 +53,12 @@ func redactValue(v any) any {
 	}
 }
 
+func redactValue(v any) any {
+	return RedactValue(v)
+}
+
 func redactJSON(v any) string {
-	b, err := json.Marshal(redactValue(v))
+	b, err := json.Marshal(RedactValue(v))
 	if err != nil {
 		return "<unserializable>"
 	}
